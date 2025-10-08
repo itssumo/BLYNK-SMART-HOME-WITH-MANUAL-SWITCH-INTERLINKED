@@ -1,243 +1,150 @@
-// #define BLYNK_TEMPLATE_ID "TMPL6FG3Uti_B"
-// #define BLYNK_TEMPLATE_NAME "SMART HOME"
-// #define BLYNK_AUTH_TOKEN "9mYX_XzDif1rCXVbNYIHINWAZ_jAIVKR"
-/* Comment this out to disable prints and save space */
-#define BLYNK_TEMPLATE_ID           "TMPL6szvd0yhQ"
-#define BLYNK_TEMPLATE_NAME         "SMART DUSTBIN"
-#define BLYNK_AUTH_TOKEN            "KlQuGyx8XdkLNwt6efCFt8hEC3IEraz2"
+/***************  SMART HOME – ESP8266 (4 Relays + PWM Fan)  *****************
+ * Local wall switches + Blynk virtual buttons stay in sync either way.
+ * Works offline (local switches) and online (Blynk). Debounced inputs.
+ * Board: NodeMCU/ESP-12E (ESP8266)
+ *****************************************************************************/
+
+// ---- Replace with your own (DO NOT commit real secrets to GitHub) ----
+#define BLYNK_TEMPLATE_ID   "YOUR_TEMPLATE_ID"
+#define BLYNK_TEMPLATE_NAME "SMART HOME"
+#define BLYNK_AUTH_TOKEN    "YOUR_BLYNK_AUTH_TOKEN"
+
+const char* WIFI_SSID = "YOUR_WIFI_SSID";
+const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
+// ---------------------------------------------------------------------
+
 #define BLYNK_PRINT Serial
-
-
 #include <ESP8266WiFi.h>
 #include <BlynkSimpleEsp8266.h>
+#include <Ticker.h>
 
-// Your WiFi credentials.
-// Set password to "" for open networks.
-char ssid[] = "SMART DUSTBIN";
-char pass[] = "DUSTBIN1234";
-const char* host = "www.google.com";
-int k1 = D0;
-int k2 = D2;
-int k3 = D3;
-int k4 = D4;
-int speedPin = D1;
-int sw1 = D5; 
-int sw2 = D6;
-int sw3 = D7; 
-int sw4 = D8;
-int led = A0;
-int currentSpeed = 0;
-int state1, state2, state3, state4 = 1;
-int btn_state, btn_state1, btn_state2, btn_state3 = 0;
-int preState, preState1, preState2, preState3 = 0;
-bool isConnected = Blynk.connected();
+//////////////////// Hardware mapping ////////////////////
+// Relays (active-LOW)
+const uint8_t RELAY_PINS[4]   = { D0, D2, D3, D4 };  // k1..k4
+// Wall switches (to GND, use INPUT_PULLUP)
+const uint8_t SWITCH_PINS[4]  = { D5, D6, D7, D8 };  // sw1..sw4
+// PWM pin for DC fan
+const uint8_t FAN_PWM_PIN     = D1;                  // speedPin
 
-void setup() {
-  Serial.begin(115200);// put your setup code here, to run once:
-  pinMode(sw1,INPUT);
-  pinMode(sw2,INPUT);
-  pinMode(sw3,INPUT);
-  pinMode(sw4,INPUT);
+// Blynk virtual pins for the 4 relays + fan slider [0..100]
+const uint8_t VPIN_RELAY[4]   = { V0, V1, V2, V3 };
+const uint8_t VPIN_FAN        = V4;
 
-  pinMode(k1, OUTPUT);
-  pinMode(k2, OUTPUT);
-  pinMode(k3, OUTPUT);
-  pinMode(k4, OUTPUT);
-  pinMode(led, OUTPUT);
-  digitalWrite(k1, HIGH);
-  digitalWrite(k2, HIGH);
-  digitalWrite(k3, HIGH);
-  digitalWrite(k4, HIGH);
-  pinMode(led, HIGH); 
-  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+//////////////////// Logic setup ////////////////////
+// Active-LOW relay logic made explicit
+const uint8_t RELAY_ON  = LOW;
+const uint8_t RELAY_OFF = HIGH;
 
-}
+// State containers (false=OFF, true=ON)
+bool relayState[4]      = { false, false, false, false };
+bool lastSwitchLevel[4] = { HIGH, HIGH, HIGH, HIGH }; // remember last raw level
+bool debouncedLevel[4]  = { HIGH, HIGH, HIGH, HIGH };
+unsigned long lastChangeMs[4] = {0,0,0,0};
 
-BLYNK_WRITE(V0){
-  int state = param.asInt();
-  if(state == 1){
-    state1 = 0;
-  }else if(state == 0){
-    state1 = 1;
+int fanDuty = 0;  // 0..255
 
+// Debounce parameters
+const unsigned long DEBOUNCE_MS = 40;
+
+BlynkTimer timer;   // for periodic tasks
+
+//////////////////// Helpers ////////////////////
+void applyRelay(uint8_t idx, bool on, bool notifyBlynk) {
+  relayState[idx] = on;
+  digitalWrite(RELAY_PINS[idx], on ? RELAY_ON : RELAY_OFF);
+
+  if (notifyBlynk && Blynk.connected()) {
+    // Blynk button widget expects 1 for ON, 0 for OFF
+    Blynk.virtualWrite(VPIN_RELAY[idx], on ? 1 : 0);
   }
-
-}
-BLYNK_WRITE(V1){
-  int state = param.asInt();
-  if(state == 1){
-    state2 = 0;
-  }else if(state == 0){
-    state2 = 1;
-
-  }
-
-}
-BLYNK_WRITE(V2){
-  int state = param.asInt();
-  if(state == 1){
-    state3 = 0;
-  }else if(state == 0){
-    state3 = 1;
-
-  }
-
-}
-BLYNK_WRITE(V3){
-  int state = param.asInt();
-  if(state == 1){
-    state4 = 0;
-  }else if(state == 0){
-    state4 = 1;
-
-  }
-
 }
 
-
-
-BLYNK_WRITE(V4){
-  int state = param.asInt();
-  currentSpeed = map(state, 0,100,0,255);
-analogWrite(speedPin, currentSpeed );
-Serial.println(map(state, 0,100,0,255));
-
+void applyFan(int duty /*0..255*/, bool /*notifyBlynk not needed here*/) {
+  fanDuty = constrain(duty, 0, 255);
+  analogWrite(FAN_PWM_PIN, fanDuty);
 }
-////////////////////////////////////////////////////
 
+//////////////////// Blynk callbacks ////////////////////
 BLYNK_CONNECTED() {
-    Blynk.syncAll();
+  // pull server states to device on reconnect
+  Blynk.syncAll();
 }
-/////////////////////////////////////////////////////////////
 
- 
-///////////////////////////////////////////////////////////////////////
+// Each handler sets the corresponding relay
+BLYNK_WRITE(V0) { applyRelay(0, param.asInt() == 1, false); }
+BLYNK_WRITE(V1) { applyRelay(1, param.asInt() == 1, false); }
+BLYNK_WRITE(V2) { applyRelay(2, param.asInt() == 1, false); }
+BLYNK_WRITE(V3) { applyRelay(3, param.asInt() == 1, false); }
 
-void relay1(){
+// Fan slider 0..100 → 0..255 PWM
+BLYNK_WRITE(V4) {
+  int percent = constrain(param.asInt(), 0, 100);
+  int duty = map(percent, 0, 100, 0, 255);
+  applyFan(duty, false);
+}
 
-  if(digitalRead(sw1)==HIGH){
-    if(btn_state = !btn_state){
-       Blynk.virtualWrite(V0, btn_state);
-       btn_state =!btn_state;
-       preState = 1;
-       state1 = 0;
+//////////////////// Switch scanning (debounced, edge-detect) ////////////////////
+void scanSwitches() {
+  unsigned long now = millis();
+
+  for (uint8_t i = 0; i < 4; i++) {
+    int raw = digitalRead(SWITCH_PINS[i]); // HIGH = idle, LOW = pressed (active-low wiring)
+
+    if (raw != lastSwitchLevel[i]) {
+      lastSwitchLevel[i] = raw;
+      lastChangeMs[i] = now;  // start debounce window
     }
-   btn_state = !btn_state;
-  }else if(digitalRead(sw1)==LOW && preState == 1){
-    Blynk.virtualWrite(V0, 0);
-    btn_state = 0;
-    preState = 2;
-    state1 = 1;
 
-  }if(digitalRead(sw1)==LOW && preState==2){
-    Blynk.virtualWrite(V0,0);
-    preState = 0;
-    state1 = 1;
+    // stable long enough?
+    if ((now - lastChangeMs[i]) >= DEBOUNCE_MS && raw != debouncedLevel[i]) {
+      debouncedLevel[i] = raw;
+
+      // On a valid edge, toggle relay: pressing the switch (LOW) toggles
+      if (debouncedLevel[i] == LOW) {
+        bool newState = !relayState[i];
+        // Toggle came from local hardware → update Blynk so the app matches
+        applyRelay(i, newState, /*notifyBlynk=*/true);
+      }
+    }
+  }
+}
+
+//////////////////// Setup & loop ////////////////////
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+
+  // Pins
+  for (uint8_t i = 0; i < 4; i++) {
+    pinMode(RELAY_PINS[i], OUTPUT);
+    digitalWrite(RELAY_PINS[i], RELAY_OFF); // start OFF
+    pinMode(SWITCH_PINS[i], INPUT_PULLUP);  // active-low buttons/switches
   }
 
+  pinMode(FAN_PWM_PIN, OUTPUT);
+  analogWriteRange(255); // so 0..255 maps 1:1
+  applyFan(0, false);
 
-  digitalWrite(k4, state1);
-}
-void relay2(){
-    if(digitalRead(sw2)==HIGH){
-    if(btn_state1 = !btn_state1){
-       Blynk.virtualWrite(V1, btn_state1);
-       btn_state1 =!btn_state1;
-       preState1 = 1;
-       state2 = 0;
+  // WiFi + Blynk
+  Blynk.begin(BLYNK_AUTH_TOKEN, WIFI_SSID, WIFI_PASS);
+
+  // Poll switches ~50 Hz
+  timer.setInterval(20L, scanSwitches);
+
+  // If you want to periodically push states to app (helps keep widgets in sync)
+  timer.setInterval(3000L, [](){
+    if (Blynk.connected()) {
+      for (uint8_t i = 0; i < 4; i++) {
+        Blynk.virtualWrite(VPIN_RELAY[i], relayState[i] ? 1 : 0);
+      }
+      // (Optional) Also reflect the fan slider if you keep a separate % state
+      // Blynk.virtualWrite(VPIN_FAN, map(fanDuty, 0, 255, 0, 100));
     }
-   btn_state1 = !btn_state1;
-  }else if(digitalRead(sw2)==LOW && preState1 == 1){
-    Blynk.virtualWrite(V1, 0);
-    btn_state1 = 0;
-    preState1 = 2;
-    state2 = 1;
-
-  }if(digitalRead(sw2)==LOW && preState1==2){
-    Blynk.virtualWrite(V1,0);
-    preState1 = 0;
-    state2 = 1;
-  }
-
-  digitalWrite(k3, state2);
+  });
 }
-void relay3(){
-    if(digitalRead(sw3)==HIGH){
-    if(btn_state2 = !btn_state2){
-       Blynk.virtualWrite(V2, btn_state2);
-       btn_state2 =!btn_state2;
-       preState2 = 1;
-       state3= 0;
-    }
-   btn_state2 = !btn_state2;
-  }else if(digitalRead(sw3)==LOW && preState2 == 1){
-    Blynk.virtualWrite(V2, 0);
-    btn_state2 = 0;
-    preState2 = 2;
-    state3 = 1;
 
-  }if(digitalRead(sw3)==LOW && preState2==2){
-    Blynk.virtualWrite(V2,0);
-    preState2 = 0;
-    state2 = 1;
-  }
-
-  digitalWrite(k2, state3);
-}
-void relay4(){
-    if(digitalRead(sw4)==HIGH){
-    if(btn_state3 = !btn_state3){
-       Blynk.virtualWrite(V3, btn_state3);
-       btn_state3 =!btn_state3;
-       preState3 = 1;
-       state4 = 0;
-    }
-   btn_state3 = !btn_state3;
-  }else if(digitalRead(sw4)==LOW && preState3 == 1){
-    Blynk.virtualWrite(V3, 0);
-    btn_state3 = 0;
-    preState3 = 2;
-    state4 = 1;
-
-  }if(digitalRead(sw4)==LOW && preState3==2){
-    Blynk.virtualWrite(V3,0);
-    preState3 = 0;
-    state4 = 1;
-  }
-
-  digitalWrite(k1, state4);
-}
-void offlineMode(){
-  if(digitalRead(sw1)==1){digitalWrite(k4, LOW);}else if (digitalRead(sw1)==LOW){digitalWrite(k4, HIGH);}
-  if(digitalRead(sw2)==1){digitalWrite(k3, LOW);}else if (digitalRead(sw2)==LOW){digitalWrite(k3, HIGH);}
-  if(digitalRead(sw3)==1){digitalWrite(k2, LOW);}else if (digitalRead(sw3)==LOW){digitalWrite(k2, HIGH);}
-  if(digitalRead(sw4)==1){digitalWrite(k1, LOW);}else if (digitalRead(sw4)==LOW){digitalWrite(k1, HIGH);}
-  analogWrite(speedPin, currentSpeed);
-
-}
 void loop() {
-  // digitalWrite(led, HIGH);
-
-  if (WiFi.status() == WL_CONNECTED) {
-    WiFiClient client;
-    
-
-    if (client.connect(host, 80)) {
-       Blynk.run();
-      Serial.println("Connected to the internet");
-      client.stop();
-        relay1();
-        relay2();
-        relay3();
-        relay4();
-      
-    } else {
-      offlineMode();
-          Serial.println("Internet connection lost");
-      //analogWrite(led, 0);
-    }
- 
-
-
-}
+  // Online or offline, local switches always work
+  Blynk.run();
+  timer.run();
 }
